@@ -1,257 +1,378 @@
 # Kotak Telegram Trading System
 
-This repository contains two independent Python applications that work together to turn messages from Telegram trading channels into orders through Kotak Neo:
+A Python based signal pipeline that reads trading messages from Telegram, converts them into structured events with Google Gemini, and executes those events through Kotak Neo using Apache Kafka as the handoff between services.
 
-1. **Producer** (`producer/`): listens to configured Telegram chats, asks Gemini to parse each message into a structured signal, and publishes actionable signals to Kafka.
-2. **Consumer** (`consumer/`): reads signals from Kafka, resolves the live option contract through Kotak Neo, sizes the order, and manages placement, modification, and cancellation.
+> **Live trading warning:** Starting the consumer authenticates to Kotak Neo and can place, modify, or cancel real orders. There is no dry run switch. Verify the account, monitored chats, order product, sizing, and broker environment before starting it.
 
-Kafka decouples the two applications. They may run on the same machine or on separate machines, provided both can connect to the same Kafka topic. Each application has independent dependencies and configuration.
+## Contents
 
-> **Live trading:** The consumer has no dry-run mode. It can place real orders as soon as it receives an actionable signal. Configure and verify the account, channel, order product, and sizing before starting it.
+- [System at a glance](#system-at-a-glance)
+- [Architecture](#architecture)
+- [Signal and order lifecycle](#signal-and-order-lifecycle)
+- [Repository map](#repository-map)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Run the applications](#run-the-applications)
+- [Configuration reference](#configuration-reference)
+- [Run with PM2](#run-with-pm2)
+- [Deploy across machines and accounts](#deploy-across-machines-and-accounts)
+- [Operations and troubleshooting](#operations-and-troubleshooting)
+- [Security](#security)
 
-## Repository layout
+## System at a glance
+
+```mermaid
+flowchart LR
+    TG[Telegram chats] -->|new message| TL[Producer: Telethon listener]
+    TL --> GP[Gemini parser]
+    GP -->|actionable ParsedSignal| KP[Kafka producer]
+    KP -->|JSON event, contract key| K[(Kafka topic)]
+    K -->|one copy per consumer group| KC[Consumer: Kafka reader]
+    KC --> OM[Order manager]
+    OM -->|search contract, place/manage order| KN[Kotak Neo API]
+    KN --> OM
+```
+
+The producer and consumer are separate applications with separate Python environments and `.env` files. They communicate only through Kafka, so they can run on one host or on different hosts. Kafka must be reachable from both.
+
+| Component | Responsibility | Main implementation |
+| --- | --- | --- |
+| Telegram listener | Connects to Telegram, filters incoming chats, keeps a short in-memory message history | `producer/src/telegram_listener.py` |
+| Gemini parser | Turns message text and recent context into a typed signal | `producer/src/gemini_parser.py`, `producer/src/models.py` |
+| Signal dispatcher | Sends an actionable parsed signal to registered handlers | `producer/src/signal_dispatcher.py` |
+| Kafka producer | Serializes a signal as JSON and publishes it to the shared topic | `producer/src/kafka/producer.py` |
+| Kafka consumer | Reads events as a configured consumer group and reconstructs the signal | `consumer/src/kafka/consumer.py` |
+| Order manager | Resolves signal intent into contract, quantity, price, and order lifecycle actions | `consumer/src/order_manager.py` |
+| Kotak client | Authenticates, looks up contracts, and calls Kotak Neo order APIs | `consumer/src/kotak_client.py` |
+| PM2 runner | Starts and monitors producer and/or consumer processes | `runner.sh`, `ecosystem.config.cjs` |
+
+## Architecture
+
+### Process boundaries
+
+**Producer (`producer/`)** runs an asynchronous Telethon client. For every non-empty message in the configured chats, it asks Gemini to classify and extract the trading details. Non-trading messages are ignored. Actionable signals are sent to Kafka; the producer does not connect to Kotak or place orders.
+
+**Kafka** is the durable message boundary between ingestion and execution. The default topic is `kotak_trading_signals`. Events are JSON and keyed by a contract identifier such as `NIFTY_22500_CE`. The key keeps events for one contract in the same Kafka partition, preserving their partition order. The producer requests `acks=all` and enables idempotence.
+
+**Consumer (`consumer/`)** is an account-scoped worker. On startup it authenticates to Kotak Neo, subscribes to the topic using its Kafka consumer group, and passes each event to an `OrderManager`. Each account that must receive every signal needs a distinct group ID. Workers in the same group divide partitions and messages between themselves.
+
+### Signal event shape
+
+A published event contains the `ParsedSignal` fields and a `_meta` object. Important signal fields include:
+
+- `is_trading_signal` and `signal_type` (`NEW_ORDER`, `MODIFY_ORDER`, `CANCEL_ORDER`, `IGNORE_SIGNAL`, `CLOSE_POSITION`, or `NONE`)
+- `action`, `index`, `strike_price`, and `option_type`
+- `order_condition`, `entry_price`, `trigger_price`, `stop_loss`, and `target`
+- `reasoning`, `raw_message`, and UTC `timestamp`
+- `_meta.event_id`, `_meta.published_at`, and `_meta.source`
+
+Gemini output is parsed into a Pydantic model. If parsing fails, the parser returns a non-actionable `NONE` signal, which is not published. When a trading signal has a strike but no option type, the parser defaults it to `CE`.
+
+### Important delivery behavior
+
+The consumer uses manual Kafka commits and commits after order processing. Its error handler also commits a message after a processing exception to prevent the same malformed or failing event from blocking the partition. This means an order/API failure can result in an event being skipped; inspect consumer logs and Kotak order status when execution fails. The application does not provide a separate persistent order database or automatic reconciliation service.
+
+## Signal and order lifecycle
+
+1. A Telegram `NewMessage` event arrives. Empty message bodies are skipped. If `TELEGRAM_CHANNELS` is populated, only resolved chat IDs are processed.
+2. The listener passes the message and recent message history to Gemini. The history is in-memory and bounded; it is not restored after restart.
+3. Gemini returns structured JSON; the parser validates/converts it to a `ParsedSignal`. Only signals marked as actionable are dispatched.
+4. Kafka publishes the signal, keyed by `contract_key()` and annotated with an event ID and publish time.
+5. Each consumer group receives its own stream. A consumer reconstructs the signal model and calls its account's `OrderManager`.
+6. For a new order, the order manager resolves the exact live contract and lot size through Kotak Neo. It selects the nearest active expiry unless the signal specifies an expiry, calculates price/order type and quantity, and submits the order.
+7. The order manager tracks pending orders in memory and handles supported revise/cancel/close signals against tracked orders. Pending state is lost when that consumer process restarts; it is not an exchange-side order ledger.
+8. The consumer commits the Kafka offset after processing (including the error path noted above).
+
+Order conditions map to order styles in the manager: `ABOVE` and `BELOW` create stop-limit orders with a configurable buffer; `AT` and `LIMIT` create limit orders; `MARKET` creates a market order. Risk-based sizing is used only when both a risk percentage and a stop loss are available. Otherwise the configured lot count is used. If risk sizing needs capital and no `DEFAULT_CAPITAL` is set, the consumer queries available funds from Kotak.
+
+## Repository map
 
 ```text
-kotak-telegram-trading-system/
+.
 ├── producer/
-│   ├── config/          # Producer settings loaded from producer/.env
-│   ├── src/             # Telegram listener, Gemini parser, Kafka publisher
+│   ├── main.py                 # Producer CLI and async process entry point
+│   ├── config/settings.py      # Reads producer/.env
+│   ├── src/
+│   │   ├── telegram_listener.py
+│   │   ├── gemini_parser.py
+│   │   ├── signal_dispatcher.py
+│   │   ├── models.py
+│   │   └── kafka/producer.py
 │   ├── tests/
 │   ├── requirements.txt
 │   └── .env.example
 ├── consumer/
-│   ├── config/          # Consumer settings loaded from consumer/.env
-│   ├── src/             # Kafka consumer, Kotak client, order manager
+│   ├── main.py                 # Consumer CLI and async process entry point
+│   ├── config/settings.py      # Reads consumer/.env
+│   ├── src/
+│   │   ├── order_manager.py
+│   │   ├── kotak_client.py
+│   │   ├── models.py
+│   │   └── kafka/consumer.py
 │   ├── tests/
 │   ├── requirements.txt
 │   └── .env.example
-├── .gitignore
+├── ecosystem.config.cjs        # PM2 process definitions
+├── runner.sh                   # Setup and PM2 command wrapper (Bash)
 └── README.md
 ```
 
-The `.env` files and Telegram session files contain private credentials and are ignored by Git. Keep `.env.example` files as templates; never put real credentials in them.
+The local `.env` files and Telethon `.session` files are ignored by Git. Keep secrets out of `.env.example` files.
 
 ## Requirements
 
-- Python 3.10 or later.
-- Node.js and npm, to install PM2 for background process management.
-- A Kafka broker reachable by both producer and consumer. For a local setup, Docker is the easiest option.
-- Telegram API credentials and access to the chats to monitor.
-- A Gemini API key.
-- Kotak Neo API credentials for the account that will place orders.
+- Python 3.10 or newer.
+- Apache Kafka, locally or as a reachable broker. Docker is one way to run Kafka locally.
+- Telegram API ID/hash and a Telegram account with access to the desired chats.
+- Google Gemini API key.
+- Kotak Neo API credentials for the account that will execute orders.
+- Node.js/npm and PM2 only if you want the included background process runner.
+- Bash for `runner.sh`. The script is for Linux/macOS or a Bash environment such as WSL/Git Bash; its virtual environment paths are Unix-style. On native Windows, use the manual commands below with Windows activation (`.venv\\Scripts\\Activate.ps1`) or run through WSL.
 
-Install each project's dependencies in its own virtual environment; do not install both requirements files into one environment.
+Install producer and consumer requirements into separate virtual environments.
 
-## 1. Start Kafka
+## Setup
 
-For a local development broker with Docker, run this from any directory:
+### 1. Start Kafka
+
+For a local development broker using Docker:
 
 ```bash
 docker run -d --name trading-kafka -p 9092:9092 apache/kafka:4.1.2
 ```
 
-Kafka is then available to local processes at `localhost:9092`. If Docker reports that `trading-kafka` already exists, start the existing container instead:
-
-```bash
-docker start trading-kafka
-```
-
-Check its status and logs with:
+If the container already exists, start it with `docker start trading-kafka`. Check it with:
 
 ```bash
 docker ps --filter name=trading-kafka
 docker logs -f trading-kafka
 ```
 
-The applications use `kotak_trading_signals` as the default topic. A broker configured to allow automatic topic creation will create it when the producer first publishes. If automatic topic creation is disabled, create the topic using your Kafka administration tools before starting the applications.
+The default broker address is `localhost:9092`. The default topic is `kotak_trading_signals`. Kafka may create the topic automatically when enabled; otherwise create it with your broker administration tooling. For a remote broker, set a reachable broker address in both applications and configure Kafka's advertised listeners and security appropriately.
 
-For production or a shared server, use an appropriately secured Kafka deployment. Do not expose a plaintext Kafka listener to an untrusted network. Configure the broker's advertised listeners, firewall, and authentication so remote application machines can reach it.
+### 2. Set up the producer
 
-## 2. Configure and run the producer
-
-From the repository root:
+Linux/macOS/WSL, from the repository root:
 
 ```bash
 cd producer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `producer/.env` and set at least:
+Native Windows PowerShell:
 
-| Variable | Purpose |
-| --- | --- |
-| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Telegram application credentials from `my.telegram.org`. |
-| `TELEGRAM_PHONE` | Phone number for the Telegram account used to sign in. |
-| `TELEGRAM_CHANNELS` | Comma-separated channel usernames, invite links, or chat IDs to monitor. Set specific chats; an empty value listens to all incoming chats available to the account. |
-| `GEMINI_API_KEY` | API key used to parse messages with Gemini. |
-| `GEMINI_MODEL` | Gemini model name (default in the template: `gemini-3.8-flash`). |
-| `KAFKA_BOOTSTRAP_SERVERS` | Kafka broker address (default: `localhost:9092`). |
-| `KAFKA_TOPIC_SIGNALS` | Shared producer/consumer topic (default: `kotak_trading_signals`). |
-| `KAFKA_SECURITY_PROTOCOL` | Kafka security protocol (default: `PLAINTEXT`; use the settings required by your broker). |
-| `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Optional SASL credentials for a secured Kafka broker. |
+```powershell
+cd producer
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-The template also includes `GEMINI_TEMPERATURE`, `GEMINI_TIMEOUT_SECONDS`, `MESSAGE_HISTORY_CONTEXT_SIZE`, and `TELEGRAM_SESSION_NAME` to tune parsing context and session naming.
+Edit `producer/.env`. At minimum set `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`, `TELEGRAM_CHANNELS`, and `GEMINI_API_KEY`. Get Telegram API credentials from [my.telegram.org](https://my.telegram.org/). Chat entries can be usernames, invite links, or numeric chat IDs, separated by commas.
 
-### Sign in to Telegram once
-
-With the producer virtual environment active, run:
+Sign in once from the `producer/` directory with the virtual environment active:
 
 ```bash
 python main.py --login-telegram
 ```
 
-Complete Telegram's sign-in and verification prompts. The command lists the account's available channels and groups. It creates a local session file in `producer/`; protect it like a password and do not commit or share it. The producer uses that saved session on subsequent runs.
+Complete Telegram verification. The command prints available groups/channels to help identify chat IDs. It stores a `.session` file under `producer/`; protect it like a password. You do not need to repeat login unless the session is revoked or expires.
 
-### Check parsing and start publishing
-
-Optionally ask Gemini to parse one sample message without publishing it:
+Optionally check Gemini parsing without publishing an event:
 
 ```bash
 python main.py --test-signal "buy nifty 22500 above 50"
 ```
 
-This calls Gemini and may incur API usage. It does not send an order or publish the parsed signal. Start the producer with:
+This calls Gemini and may incur API usage. It does not publish to Kafka or place an order.
 
-```bash
-python main.py
-```
+### 3. Set up the consumer
 
-It connects to Telegram and Kafka and publishes actionable parsed signals. Review its logs to confirm the expected chats resolve and messages are being handled. If a configured chat cannot be resolved, the producer logs an error and ignores that chat.
-
-Producer CLI options:
-
-```text
---login-telegram        Sign in and create the Telegram session
---test-signal TEXT      Parse one message without publishing
---kafka-servers ADDR    Override KAFKA_BOOTSTRAP_SERVERS for this run
---kafka-topic NAME      Override KAFKA_TOPIC_SIGNALS for this run
-```
-
-## 3. Configure and run the consumer
-
-Open another terminal (or use the background instructions below), then from the repository root:
+Linux/macOS/WSL:
 
 ```bash
 cd consumer
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `consumer/.env` and set the Kotak Neo credentials and Kafka connection:
+Native Windows PowerShell:
 
-| Variable | Purpose |
-| --- | --- |
-| `KOTAK_CONSUMER_KEY` | Kotak Neo consumer key. |
-| `KOTAK_MOBILE_NUMBER` | Registered account mobile number. |
-| `KOTAK_UCC` | Unique client code for the trading account. |
-| `KOTAK_TOTP_KEY` | TOTP secret used for API login. |
-| `KOTAK_MPIN` | Kotak Neo MPIN. |
-| `KOTAK_ENVIRONMENT` | Kotak API environment (default: `prod`). |
-| `KAFKA_BOOTSTRAP_SERVERS` | Address of the same Kafka broker used by the producer. |
-| `KAFKA_TOPIC_SIGNALS` | Must match the producer topic (default: `kotak_trading_signals`). |
-| `KAFKA_CONSUMER_GROUP_ID` | Default consumer group name (can also be set with `--group-id`). |
-| `KAFKA_AUTO_OFFSET_RESET` | Starting offset behavior for a new consumer group (default: `latest`). |
-| `KAFKA_SECURITY_PROTOCOL` | Kafka security protocol (default: `PLAINTEXT`). |
-| `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Optional SASL credentials for a secured Kafka broker. |
+```powershell
+cd consumer
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+```
 
-Order sizing defaults are `DEFAULT_PRODUCT_TYPE=MIS` and `DEFAULT_LOTS=1`. You can set optional `RISK_PERCENTAGE` and `DEFAULT_CAPITAL` values to size orders based on stop loss and capital. If a risk percentage is configured but capital is omitted, the consumer attempts to retrieve available funds from Kotak. Review these settings carefully before trading.
+Edit `consumer/.env` with the Kotak credentials (`KOTAK_CONSUMER_KEY`, `KOTAK_MOBILE_NUMBER`, `KOTAK_UCC`, `KOTAK_TOTP_KEY`, and `KOTAK_MPIN`). Confirm the `KOTAK_ENVIRONMENT` value with the API/account setup. Make sure the consumer's Kafka broker and topic match the producer.
 
-Start a consumer after verifying all settings:
+Review `DEFAULT_PRODUCT_TYPE`, `DEFAULT_LOTS`, `RISK_PERCENTAGE`, and `DEFAULT_CAPITAL` before starting. The sample product is `MIS` and lot count is `1`. See [Configuration reference](#configuration-reference) for all options.
+
+## Run the applications
+
+Keep Kafka running before starting the services. The producer and consumer can run in separate terminals.
+
+### Start producer
+
+From `producer/` with its environment activated:
+
+```bash
+python main.py
+```
+
+It connects to Telegram and Kafka and stays active until interrupted. It logs chat resolution, incoming messages, Gemini results, and Kafka publish offsets. Keep `TELEGRAM_CHANNELS` limited to intended sources. If it is empty, the listener handles all incoming channel messages available to that Telegram account.
+
+Producer options:
+
+```text
+--login-telegram       Sign in and create the Telegram session
+--test-signal TEXT     Parse one message without publishing
+--kafka-servers ADDR   Override KAFKA_BOOTSTRAP_SERVERS
+--kafka-topic NAME     Override KAFKA_TOPIC_SIGNALS
+```
+
+### Start consumer
+
+From `consumer/` with its environment activated:
 
 ```bash
 python main.py --account-id acc_main --group-id kotak_executor_acc_main
 ```
 
-The consumer authenticates to Kotak during startup. Missing credentials, authentication failures, or an inability to resolve a live contract prevent normal order execution. When actionable Kafka messages arrive, the consumer places or manages orders through the configured account.
+The consumer authenticates to Kotak during startup. It will fail to start if the credentials are incomplete, the Kotak authentication fails, or required dependencies are unavailable. Once connected, actionable topic events can result in live order actions.
 
-Consumer CLI options:
+Consumer options:
 
 | Option | Purpose |
 | --- | --- |
-| `--account-id ID` | Label used in logs (default: `default`). |
-| `--group-id NAME` | Kafka consumer group. Use a distinct group for each account that should receive every signal. |
-| `--kafka-servers ADDR` | Override the broker address for this run. |
-| `--kafka-topic NAME` | Override the topic for this run. |
+| `--account-id ID` | Account label used in logs; defaults to `default`. |
+| `--group-id NAME` | Kafka group ID. Use a unique value for each account that must get every signal. |
+| `--kafka-servers ADDR` | Override `KAFKA_BOOTSTRAP_SERVERS`. |
+| `--kafka-topic NAME` | Override `KAFKA_TOPIC_SIGNALS`. |
 | `--lots N` | Override default lot count. |
-| `--product MIS` or `--product NRML` | Override order product. |
-| `--risk-percent PERCENT` | Override risk percentage for risk-based sizing. |
-| `--capital AMOUNT` | Override capital used for sizing. |
+| `--product MIS\|NRML` | Override product type. |
+| `--risk-percent PERCENT` | Override risk percentage. |
+| `--capital AMOUNT` | Override capital used by risk sizing. |
 
-See the full argument list at any time with `python main.py --help` from the `consumer/` directory.
+See the complete CLI usage with `python main.py --help` in the corresponding application directory.
 
-## Run services in the background with PM2
+## Configuration reference
 
-The root-level `runner.sh` sets up both Python environments and manages the producer and consumer as background processes through PM2. Kafka runs separately; start the broker before starting the applications.
+Each application loads its own `.env` from its project directory. Environment variables already set in the process may also supply values. Defaults below reflect the checked-in templates and settings.
 
-Install PM2 once if it is not already installed:
+### Producer (`producer/.env`)
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | Telegram application credentials | empty / `0` |
+| `TELEGRAM_PHONE` | Phone used for Telegram sign-in | empty |
+| `TELEGRAM_SESSION_NAME` | Session filename stem | `kotak_trader_session` |
+| `TELEGRAM_CHANNELS` | Comma-separated chat IDs, usernames, or links | template: `@your_signals_channel`; empty means all incoming channel messages |
+| `GEMINI_API_KEY` | Gemini API credential | empty |
+| `GEMINI_MODEL` | Model name used by Gemini | `gemini-3.8-flash` in template/settings |
+| `GEMINI_TEMPERATURE` | Parsing generation temperature | `0.1` |
+| `GEMINI_TIMEOUT_SECONDS` | Configured parser timeout value | `30` |
+| `MESSAGE_HISTORY_CONTEXT_SIZE` | Number of recent messages supplied as context | `5` |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka bootstrap address(es) | `localhost:9092` |
+| `KAFKA_TOPIC_SIGNALS` | Shared signal topic | `kotak_trading_signals` |
+| `KAFKA_SECURITY_PROTOCOL` | Kafka protocol | `PLAINTEXT` |
+| `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Optional Kafka SASL auth | unset |
+
+### Consumer (`consumer/.env`)
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `KOTAK_CONSUMER_KEY` | Kotak Neo API consumer key | empty |
+| `KOTAK_MOBILE_NUMBER` | Registered account phone | empty |
+| `KOTAK_UCC` | Unique client code | empty |
+| `KOTAK_TOTP_KEY` | Base32 TOTP secret for API login | empty |
+| `KOTAK_MPIN` | Kotak Neo MPIN | empty |
+| `KOTAK_ENVIRONMENT` | Kotak API environment | `prod` |
+| `DEFAULT_PRODUCT_TYPE` | Default product | `MIS` |
+| `DEFAULT_LOTS` | Fallback number of lots | `1` |
+| `SL_LIMIT_BUFFER_PERCENT` | Limit-price buffer for stop-limit orders | `1.0` percent |
+| `AUTO_CANCEL_ON_REVISE` | Whether a revision cancels the existing pending order | `true` |
+| `RISK_PERCENTAGE` | Risk fraction expressed as a percentage | unset |
+| `DEFAULT_CAPITAL` | Capital for risk-based sizing, INR | unset; live funds are requested if required |
+| `KAFKA_BOOTSTRAP_SERVERS` | Kafka bootstrap address(es) | `localhost:9092` |
+| `KAFKA_TOPIC_SIGNALS` | Shared signal topic; must match producer | `kotak_trading_signals` |
+| `KAFKA_CONSUMER_GROUP_ID` | Default consumer group ID | `kotak_executor_default` |
+| `KAFKA_AUTO_OFFSET_RESET` | Initial offset policy for a new group | `latest` |
+| `KAFKA_SECURITY_PROTOCOL` | Kafka protocol | `PLAINTEXT` |
+| `KAFKA_SASL_MECHANISM`, `KAFKA_SASL_USERNAME`, `KAFKA_SASL_PASSWORD` | Optional Kafka SASL auth | unset |
+
+`--group-id` takes precedence over `KAFKA_CONSUMER_GROUP_ID`. CLI options for product, lots, risk percentage, and capital override their configuration defaults for that run.
+
+## Run with PM2
+
+`runner.sh` is a Bash script that provisions both Python environments and manages processes through PM2. Kafka remains a separately managed service. Install Node.js/npm and PM2 first:
 
 ```bash
-sudo npm install -g pm2
+npm install -g pm2
 ```
 
-Make sure `producer/.env` and `consumer/.env` exist and contain the required values. The setup command creates either file from its `.env.example` template if missing, then installs that project's Python requirements:
+From the repository root, on Linux/macOS/WSL:
 
 ```bash
 chmod +x runner.sh
 ./runner.sh setup
 ```
 
-Edit both `.env` files with the settings described above. Then authenticate Telegram interactively once:
+Edit both `.env` files, then create the Telegram session:
 
 ```bash
 ./runner.sh login-telegram
 ```
 
-Start Kafka, then start both applications under PM2:
+Start both services (and Kafka separately beforehand):
 
 ```bash
 ./runner.sh start acc_main kotak_executor_acc_main
 ```
 
-The runner checks that Telegram, Gemini, and Kotak credentials are present and that the Telegram session exists before starting. If the session has expired, run `./runner.sh login-telegram` again. To perform setup and then attempt startup in one command after filling configuration and creating a Telegram session, use `./runner.sh setup-start acc_main kotak_executor_acc_main`.
+The runner checks required credentials and the Telegram session file before it starts processes. It starts/restarts entries from `ecosystem.config.cjs` and saves the PM2 process list.
 
-PM2 controls both processes in the background. Use these commands from the repository root:
+| Command | Action |
+| --- | --- |
+| `./runner.sh setup` | Create both virtual environments, install requirements, and copy missing `.env` files. |
+| `./runner.sh setup-producer` | Set up only producer. |
+| `./runner.sh setup-consumer` | Set up only consumer. |
+| `./runner.sh login-telegram` | Sign into Telegram interactively. |
+| `./runner.sh start [ACCOUNT] [GROUP]` | Start/restart producer and consumer. |
+| `./runner.sh start-producer` | Start/restart only producer. |
+| `./runner.sh start-consumer [ACCOUNT] [GROUP]` | Start/restart only consumer. |
+| `./runner.sh setup-start [ACCOUNT] [GROUP]` | Set up both projects, then try to start both. |
+| `./runner.sh status` | Show PM2 process status. |
+| `./runner.sh logs [producer\|consumer]` | Follow both logs or one service's logs. |
+| `./runner.sh stop` | Stop both processes. |
+| `./runner.sh restart [ACCOUNT] [GROUP]` | Start/restart both services. |
+| `./runner.sh delete` | Stop and remove both PM2 entries. |
 
-```bash
-./runner.sh status
-./runner.sh logs                 # Follow logs from both processes
-./runner.sh logs producer        # Follow only producer logs
-./runner.sh logs consumer        # Follow only consumer logs
-./runner.sh stop
-./runner.sh restart acc_main kotak_executor_acc_main
-./runner.sh delete               # Stop and remove both PM2 entries
-```
+For PM2 startup after machine reboot, run `pm2 startup`, execute the command it prints, then run `pm2 save`. Use `./runner.sh stop` before intentionally stopping the applications or their broker.
 
-The runner saves the PM2 process list. To have PM2 restore it after a machine reboot, configure PM2's startup service once with `pm2 startup`, run the command PM2 prints, and then run `pm2 save`. Use `./runner.sh stop` before intentionally stopping Kafka or shutting down the apps.
+## Deploy across machines and accounts
 
-## Run on separate machines
+The producer host and consumer host both connect to Kafka. Set `KAFKA_BOOTSTRAP_SERVERS` to a network address each host can reach; `localhost` only works when Kafka runs on that same host. Configure Kafka `advertised.listeners` to return reachable broker addresses and restrict firewall access. See the [Kafka broker configuration](https://kafka.apache.org/41/configuration/broker-configs/) reference.
 
-The producer can run on a machine with Telegram access, while the consumer runs on a machine with the Kotak environment. Both must use the same Kafka broker address, topic, and compatible security settings. For each app, configure `KAFKA_BOOTSTRAP_SERVERS` to an address reachable from that machine, rather than `localhost` when Kafka is elsewhere. Configure the Kafka broker to advertise a reachable address and permit the required network connections; a host firewall or cloud firewall may also need a rule for the broker listener.
-
-To have multiple Kotak accounts receive every signal, run one consumer process per account with a unique `--group-id` for each. Processes in the same Kafka consumer group divide messages among themselves, so do not reuse a group ID when each account needs every signal.
-
-### Add a consumer on another VM
-
-The remote consumer does **not** connect directly to the producer. Both applications connect to Kafka: the producer publishes to `kotak_trading_signals`, and each consumer group reads its own copy of those events.
-
-On the consumer VM, clone the repository, install PM2 if necessary, and set up only the consumer:
+To add a consumer on another Linux/WSL VM:
 
 ```bash
 git clone https://github.com/pawanbudati/neo-telegram-trading-system.git
 cd neo-telegram-trading-system
-sudo npm install -g pm2
+npm install -g pm2
 chmod +x runner.sh
 ./runner.sh setup-consumer
 ```
 
-Edit `consumer/.env` on that VM. Give it that account's Kotak credentials, and set `KAFKA_BOOTSTRAP_SERVERS` to the Kafka VM's reachable private hostname or IP and port, for example `10.0.0.12:9092`. Keep `KAFKA_TOPIC_SIGNALS=kotak_trading_signals` and `KAFKA_SECURITY_PROTOCOL` consistent with the broker and producer. Do not use `localhost:9092` on the consumer VM unless Kafka is running on that same VM.
-
-Then start only the consumer process with a unique account ID and consumer group:
+Fill in that VM's `consumer/.env` with its account credentials and the Kafka VM's reachable private address, for example `10.0.0.12:9092`. Then start only the consumer:
 
 ```bash
 ./runner.sh start-consumer acc_secondary kotak_executor_acc_secondary
@@ -259,33 +380,24 @@ Then start only the consumer process with a unique account ID and consumer group
 ./runner.sh logs consumer
 ```
 
-`start-consumer` does not start another producer. Repeat this on each account VM, using that account's credentials and a different group ID each time. The default offset policy is `latest`, so start each new consumer before you expect signals, or set `KAFKA_AUTO_OFFSET_RESET=earliest` if a brand-new group should read retained earlier events too.
+Repeat per account, using the proper Kotak credentials and a distinct group ID. Different consumer groups each receive every retained event. Consumers sharing a group split the work. With the default `latest` policy, a new group starts with messages published after it joins; use `earliest` if a new group should consume retained earlier events.
 
-The Kafka VM must accept connections from the consumer VM on the broker listener port. With cloud VMs, allow that port only from the consumer VM's private IP or private network. Also configure Kafka's `advertised.listeners` so it tells remote clients to reconnect to a hostname/IP they can reach; setting the consumer's bootstrap address alone is not enough if the broker advertises `localhost` or a private address unreachable from that VM. Kafka documents `advertised.listeners` as the broker endpoints clients use to connect ([broker configuration](https://kafka.apache.org/41/configuration/broker-configs/)). Avoid exposing an unauthenticated plaintext broker to the public internet.
+## Operations and troubleshooting
 
-## Tests
+- **Producer says channel resolution failed:** Check Telegram account membership and the exact `TELEGRAM_CHANNELS` username, invite link, or ID. The listener logs failures and continues with successfully resolved chats.
+- **Telegram authorization is missing:** Run `python main.py --login-telegram` from `producer/` or `./runner.sh login-telegram`, then verify that the configured session file exists.
+- **No Kafka connection:** Confirm the broker is running, the address is reachable from that process, the topic exists if auto-creation is disabled, and protocol/SASL settings match.
+- **Consumer does not see older events:** A new group defaults to `latest`; set `KAFKA_AUTO_OFFSET_RESET=earliest` for a brand-new group that should read retained events.
+- **Consumer cannot authenticate to Kotak:** Check all five Kotak credential values, system time (TOTP depends on it), environment, and the API response in consumer logs.
+- **Contract lookup fails:** Verify the signal's index/strike/option type and that Kotak returns a currently active expiry. The client deliberately refuses to guess a symbol.
+- **Order is not placed or modified:** Review the consumer's execution result and Kotak order status. Kafka messages are committed even on processing errors, so a failure will not automatically retry the event.
+- **Process status/logs:** Use `./runner.sh status`, `./runner.sh logs producer`, and `./runner.sh logs consumer`; PM2 logs are managed separately from the application source.
 
-Install pytest in the corresponding virtual environment if it is not already available, then run each project's tests from that project's directory:
+## Security
 
-```bash
-cd producer
-python -m pip install pytest
-python -m pytest
-```
-
-```bash
-cd consumer
-python -m pip install pytest
-python -m pytest
-```
-
-Consumer order-management tests use a test-only fake client and do not connect to Kotak. Tests do not place live orders.
-
-## Security and operational checklist
-
-- The consumer sends live orders. It has no dry-run mode. Only start it when you intend to trade.
-- Check `KOTAK_ENVIRONMENT`, the account credentials, product type, lots, capital, and risk percentage before starting the consumer.
-- Restrict `TELEGRAM_CHANNELS` to the intended channels. An empty setting means the account listens to all incoming chats it can access.
-- Never commit `.env`, Telegram session files, API keys, MPINs, TOTP secrets, broker credentials, or log files.
-- Use authenticated and encrypted Kafka connectivity outside a trusted development machine. Do not expose a PLAINTEXT broker on a public network.
-- Monitor both application logs. The producer reports channel and parsing activity; the consumer reports Kafka messages and Kotak execution responses.
+- The consumer is a live trading executor and has no dry-run mode. Start it only after checking all account and order settings.
+- Keep `TELEGRAM_CHANNELS` restricted to intended chats; an empty value monitors all incoming channel messages the signed-in account can receive.
+- Never commit `.env`, `.session` files, API keys, MPINs, TOTP secrets, or broker credentials.
+- Use authenticated/encrypted Kafka connectivity outside a trusted development setup. Do not expose a plaintext broker to the public internet; restrict network access to required hosts.
+- The Gemini parser sends message text and recent message context to Google's Gemini API. Ensure this is appropriate for the source chat and your data-handling requirements.
+- Active/pending order tracking and Telegram history are in process memory. A process restart clears that local state.
